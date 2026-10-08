@@ -207,7 +207,7 @@ type sandboxScreen struct {
 
 func newSandboxScreen(deps *Deps) *sandboxScreen {
 	var missing []string
-	if !deps.DryRun {
+	if !deps.DryRun && (deps.Builder == nil || !snapshot.HasMicroVMDeps(deps.Builder.Root)) {
 		missing = doctor.MissingMicroVMTools()
 	}
 	cur := 0

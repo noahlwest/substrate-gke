@@ -128,6 +128,32 @@ func TestMicroVMToolsCheckWarnsWhenMissing(t *testing.T) {
 	t.Fatal(`no "microvm-tools" check found`)
 }
 
+// Once a tree has native Go micro-VM staging in ate-setup
+// (cmd/ate-setup/internal/steps/microvm.go), asset extraction and SHA-256
+// verification happen in Go, so missing host tools must not warn.
+func TestMicroVMToolsCheckPassesWhenBuiltIntoAteSetup(t *testing.T) {
+	t.Setenv("PATH", t.TempDir())
+	root := t.TempDir()
+	stepPath := filepath.Join(root, "cmd", "ate-setup", "internal", "steps", "microvm.go")
+	if err := os.MkdirAll(filepath.Dir(stepPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(stepPath, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range Checks(root, false) {
+		if c.Key != "microvm-tools" {
+			continue
+		}
+		got := c.Run(context.Background())
+		if got.Status != Pass {
+			t.Fatalf("expected Pass when microvm-deps is in ate-setup, got %+v", got)
+		}
+		return
+	}
+	t.Fatal(`no "microvm-tools" check found`)
+}
+
 // With --substrate-root the fetch preamble is a bare `cd`, so a git-less host
 // can still install. Blocking there would refuse a flow the README advertises.
 func TestGitIsOnlyFatalWhenTheInstallerFetches(t *testing.T) {

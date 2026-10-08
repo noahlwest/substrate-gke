@@ -89,8 +89,9 @@ func FilestoreCSI() []ChecklistItem {
 	}
 }
 
-// MicroVMDeps tracks the three phases of `install-microvm-deps.sh --install`,
-// preceded by the same pinned fetch the other in-tree steps pay for.
+// MicroVMDeps tracks the three phases of `ate-setup deploy sandboxconfig` (and
+// the `install-microvm-deps.sh --install` fallback), preceded by the same
+// pinned fetch the other in-tree steps pay for.
 //
 // The assemble row matches either outcome: a first run builds the asset set,
 // and a later one finds it already in bin/microvm-assets and skips. Both mean

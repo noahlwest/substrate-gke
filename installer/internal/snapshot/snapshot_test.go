@@ -340,7 +340,7 @@ func TestFilestoreScriptQuotesWizardAnswers(t *testing.T) {
 	}
 }
 
-// The micro-VM script uploads assets and applies a cluster-scoped resource, so
+// The micro-VM step uploads assets and applies a cluster-scoped resource, so
 // pointing it at the wrong cluster is not a no-op. It must target the cluster
 // the wizard chose, never whatever context happens to be ambient.
 func TestInstallMicroVMDepsTargetsTheChosenCluster(t *testing.T) {
@@ -353,6 +353,7 @@ func TestInstallMicroVMDepsTargetsTheChosenCluster(t *testing.T) {
 		"gcloud container clusters get-credentials " + ShellQuote(st.ClusterName),
 		"--location " + ShellQuote(st.Zone),
 		"--project " + ShellQuote(st.ProjectID),
+		"go run ./cmd/ate-setup deploy sandboxconfig",
 		"hack/install-microvm-deps.sh --install",
 	} {
 		if !strings.Contains(script, want) {
@@ -361,11 +362,116 @@ func TestInstallMicroVMDepsTargetsTheChosenCluster(t *testing.T) {
 	}
 }
 
+// A tree whose ate-setup has native Go micro-VM staging
+// (cmd/ate-setup/internal/steps/microvm.go) stages micro-VM assets and applies
+// the SandboxConfig through `ate-setup deploy sandboxconfig`, surviving
+// install-microvm-deps.sh's removal upstream; older trees, the pinned Commit
+// among them, fall back to hack/install-microvm-deps.sh --install.
+func TestMicroVMDepsPrefersAteSetup(t *testing.T) {
+	b := NewBuilder(fakeCheckout(t), false)
+	spec := b.InstallMicroVMDeps(testSetup(t))
+	script := spec.Argv[2]
+
+	check := strings.Index(script, "if [ -f "+microVMDepsStep+" ]; then\n")
+	ateSetup := strings.Index(script, "go run ./cmd/ate-setup deploy sandboxconfig\n")
+	elseAt := strings.Index(script, "\nelse\n")
+	fallback := strings.Index(script, "hack/install-microvm-deps.sh --install\n")
+	if check < 0 || ateSetup < check || elseAt < ateSetup || fallback < elseAt {
+		t.Errorf("want `if [ -f %s ]` → ate-setup → else → install-microvm-deps.sh:\n%s", microVMDepsStep, script)
+	}
+	// Display is fixed before the tree is inspected, so it must not
+	// name one branch as the command that runs; each branch announces
+	// itself instead.
+	if strings.HasPrefix(spec.Display, "go run") || strings.HasPrefix(spec.Display, "./hack") || strings.HasPrefix(spec.Display, "hack/") {
+		t.Errorf("display names one branch as the command: %q", spec.Display)
+	}
+	if !spec.DisplayIsSummary {
+		t.Errorf("the step title is not marked as a summary, so it is shown as a command")
+	}
+	for _, want := range []string{
+		"then\n  echo 'Deploying with: go run ./cmd/ate-setup deploy sandboxconfig'\n",
+		"else\n  echo 'Deploying with: hack/install-microvm-deps.sh --install'\n",
+	} {
+		if !strings.Contains(script, want) {
+			t.Errorf("script does not announce its branch with %q:\n%s", want, script)
+		}
+	}
+	if err := exec.Command("bash", "-n", "-c", script).Run(); err != nil {
+		t.Errorf("script is not valid shell: %v\n%s", err, script)
+	}
+}
+
+// Runs the branch InstallMicroVMDeps takes under real bash, with go and
+// install-microvm-deps.sh stubbed, in a tree with and without ate-setup's
+// native Go micro-VM staging.
+func TestMicroVMDepsBranchesOnTheTree(t *testing.T) {
+	b := NewBuilder(fakeCheckout(t), false)
+	st := testSetup(t)
+
+	const viaAteSetup = "Deploying with: go run ./cmd/ate-setup deploy sandboxconfig"
+	const viaInstallScript = "Deploying with: hack/install-microvm-deps.sh --install"
+	for _, tc := range []struct {
+		name       string
+		hasMicroVM bool
+		want       string
+		announce   string
+	}{
+		{"new tree", true, "go run ./cmd/ate-setup deploy sandboxconfig", viaAteSetup},
+		{"old tree", false, "install-microvm-deps.sh --install", viaInstallScript},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			bin := filepath.Join(dir, "bin")
+			for path, body := range map[string]string{
+				filepath.Join(bin, "go"):                              `echo "go $*" >> calls`,
+				filepath.Join(dir, "hack", "install-microvm-deps.sh"): `echo "install-microvm-deps.sh $*" >> calls`,
+			} {
+				if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(path, []byte("#!/bin/sh\n"+body+"\n"), 0o755); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if tc.hasMicroVM {
+				stepPath := filepath.Join(dir, microVMDepsStep)
+				if err := os.MkdirAll(filepath.Dir(stepPath), 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(stepPath, nil, 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			// Everything from the branch check on: the fetch and the
+			// get-credentials before it need a network.
+			script := b.InstallMicroVMDeps(st).Argv[2]
+			script = "set -euo pipefail\n" + script[strings.Index(script, "if [ -f "+microVMDepsStep+" ]; then"):]
+			cmd := exec.Command("bash", "-c", script)
+			cmd.Dir = dir
+			cmd.Env = []string{"PATH=" + bin + ":" + os.Getenv("PATH"), "HOME=" + dir}
+			out, err := cmd.CombinedOutput()
+			if err != nil {
+				t.Fatalf("script failed: %v\n%s", err, out)
+			}
+			calls, _ := os.ReadFile(filepath.Join(dir, "calls"))
+			if got := strings.TrimSpace(string(calls)); got != tc.want {
+				t.Errorf("ran %q, want %q", got, tc.want)
+			}
+			if got := strings.TrimSpace(string(out)); got != tc.announce {
+				t.Errorf("printed %q, want %q", got, tc.announce)
+			}
+		})
+	}
+}
+
 // The assets are executed by the cluster's nodes, not by the workstation
 // running the wizard, and they land in the project's GCS bucket, not in a
 // kind-local one. Both are the script's inputs rather than its defaults, so
-// an inherited ARCH or ATE_INSTALL_KIND from the operator's shell would
-// silently produce a broken install.
+// an inherited ARCH, ATE_INSTALL_KIND, or ATE_INSTALL_SKIP_MICROVM_DEPS from
+// the operator's shell would silently produce a broken install. Meanwhile
+// DeployAteSystem (Step 6) sets ATE_INSTALL_SKIP_MICROVM_DEPS=true so
+// micro-VM staging remains an opt-in step in Step 9.
 func TestMicroVMDepsPinArchAndStagingTarget(t *testing.T) {
 	st := testSetup(t)
 	st.SandboxClass = state.SandboxMicroVM
@@ -373,11 +479,14 @@ func TestMicroVMDepsPinArchAndStagingTarget(t *testing.T) {
 	b := NewBuilder(fakeCheckout(t), false)
 
 	for _, spec := range []execx.Spec{b.InstallMicroVMDeps(st), b.DeployDemo(st, "counter")} {
-		for _, want := range []string{"ARCH=amd64", "ATE_INSTALL_KIND=false"} {
+		for _, want := range []string{"ARCH=amd64", "ATE_INSTALL_KIND=false", "ATE_INSTALL_SKIP_MICROVM_DEPS=false"} {
 			if !slices.Contains(spec.Env, want) {
 				t.Errorf("%s: env missing %q:\n%v", spec.Label, want, spec.Env)
 			}
 		}
+	}
+	if deploy := b.DeployAteSystem(st); !slices.Contains(deploy.Env, "ATE_INSTALL_SKIP_MICROVM_DEPS=true") {
+		t.Errorf("%s: env must set ATE_INSTALL_SKIP_MICROVM_DEPS=true so Step 6 leaves micro-VM staging to Step 9:\n%v", deploy.Label, deploy.Env)
 	}
 }
 

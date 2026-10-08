@@ -722,6 +722,12 @@ func (b *Builder) Bootstrap(st *state.Setup) execx.Spec {
 // cmd/ate-setup. ate-setup fetches cluster credentials itself from
 // PROJECT_ID/CLUSTER_NAME/CLUSTER_LOCATION, and ko builds and pushes the
 // control-plane images from the checkout's source.
+//
+// ATE_INSTALL_SKIP_MICROVM_DEPS=true keeps `ate-setup deploy ate-system` from
+// staging ~500MB of micro-VM assets and applying the `microvm` SandboxConfig
+// during Step 6 on trees that folded micro-VM staging into `deploy ate-system`
+// (agent-substrate/substrate#2092); micro-VM remains an opt-in choice in Step 9
+// (InstallMicroVMDeps). Older trees ignore the environment variable.
 func (b *Builder) DeployAteSystem(st *state.Setup) execx.Spec {
 	display, argv := imageArgs(st)
 	sim := append(b.fetchSimLines(),
@@ -743,11 +749,13 @@ func (b *Builder) DeployAteSystem(st *state.Setup) execx.Spec {
 			"Building github.com/agent-substrate/substrate/cmd/atelet",
 		)
 	}
+	env := append(b.env(st), "ATE_INSTALL_SKIP_MICROVM_DEPS=true")
+	env = append(env, credentialProviderEnv()...)
 	return execx.Spec{
 		Label:   "ate-setup deploy ate-system",
 		Display: "go run ./cmd/ate-setup deploy ate-system" + display,
 		Argv:    b.inTree("go run ./cmd/ate-setup deploy ate-system" + argv),
-		Env:     append(b.env(st), credentialProviderEnv()...),
+		Env:     env,
 		SimLines: append(sim,
 			"[step]: deploy_k8s_credential_provider",
 			"[step]: Waiting for ATE system components to be ready...",
@@ -919,68 +927,114 @@ func (b *Builder) DeployDemo(st *state.Setup, name string) execx.Spec {
 	}
 }
 
-// microVMEnv is env plus the two settings upstream's micro-VM script reads
-// that no other step needs.
+// microVMDepsStep is where ate-setup implements micro-VM asset assembly,
+// staging, and SandboxConfig application for `deploy sandboxconfig` (and
+// `deploy ate-system`, added in agent-substrate/substrate#2092). Its presence
+// in the checkout means `ate-setup deploy sandboxconfig` stages micro-VM
+// assets and applies the `microvm` SandboxConfig natively in Go; older trees,
+// the pinned Commit among them, fall back to hack/install-microvm-deps.sh
+// --install.
+const microVMDepsStep = "cmd/ate-setup/internal/steps/microvm.go"
+
+// HasMicroVMDeps reports whether the Substrate tree at root stages micro-VM
+// assets natively in Go via ate-setup (`cmd/ate-setup/internal/steps/microvm.go`).
+// A tree that has it stages the micro-VM assets and deploys the
+// counter-microvm demo in Go without needing the host tools in
+// doctor.MicroVMTools.
+func HasMicroVMDeps(root string) bool {
+	_, err := os.Stat(filepath.Join(root, microVMDepsStep))
+	return err == nil
+}
+
+// microVMEnv is env plus the settings upstream's micro-VM asset staging
+// (`ate-setup deploy sandboxconfig` and the `hack/install-microvm-deps.sh`
+// fallback) reads that no other step needs.
 //
-// ARCH is pinned rather than left to the script's own resolution, which reads
-// KO_DEFAULTPLATFORMS and falls back to the workstation's `go env GOARCH`.
-// env only sets KO_DEFAULTPLATFORMS when the install builds from source, so a
-// pre-built install leaves the script on that fallback — and the assets are
-// executed by the cluster's nodes, not by the workstation. From an arm64
-// laptop that stages arm64 binaries into the bucket, and the failure surfaces
-// much later, as a cold boot that cannot exec them.
+// ARCH is pinned rather than left to upstream's own resolution, which reads
+// KO_DEFAULTPLATFORMS and falls back to the workstation's GOARCH / `go env
+// GOARCH`. env only sets KO_DEFAULTPLATFORMS when the install builds from
+// source, so a pre-built install leaves upstream on that fallback — and the
+// assets are executed by the cluster's nodes, not by the workstation. From an
+// arm64 laptop that stages arm64 binaries into the bucket, and the failure
+// surfaces much later, as a cold boot that cannot exec them.
 //
 // ATE_INSTALL_KIND=false selects the GCS staging path over the in-cluster
-// rustfs one. It is already the script's default; naming it here keeps a
-// developer's exported value from redirecting a GKE install's assets into a
-// kind bucket that does not exist.
+// rustfs one. ATE_INSTALL_SKIP_MICROVM_DEPS=false ensures `ate-setup deploy
+// sandboxconfig` stages the micro-VM assets even if the operator exported
+// ATE_INSTALL_SKIP_MICROVM_DEPS=true in their shell (which
+// hack/ate-dev-env.sh.example suggests for gVisor-only dev runs).
 //
 // The KUBECTL_CONTEXT that env blanks matters most here: with one set,
-// install-microvm-deps.sh skips its up-front context check and install-ate.sh
-// skips its own get-credentials, so an inherited dev-env context (absent from
-// the throwaway KUBECONFIG credentialLines writes) would fail only at
-// `kubectl apply`, after the assets were assembled and uploaded. Blank, both
-// use that KUBECONFIG's current context — install-ate.sh re-fetches the same
-// credentials into it first, which is redundant but harmless.
+// ate-setup and install-microvm-deps.sh skip their up-front context/credential
+// setup and install-ate.sh skips its own get-credentials, so an inherited
+// dev-env context (absent from the throwaway KUBECONFIG credentialLines writes)
+// would fail only when talking to the cluster, after the assets were assembled
+// and uploaded. Blank, they use that KUBECONFIG's current context —
+// ate-setup and install-ate.sh re-fetch the same credentials into it first,
+// which is redundant but harmless.
 func (b *Builder) microVMEnv(st *state.Setup) []string {
-	return append(b.env(st), "ARCH="+targetArch, "ATE_INSTALL_KIND=false")
+	return append(b.env(st),
+		"ARCH="+targetArch,
+		"ATE_INSTALL_KIND=false",
+		"ATE_INSTALL_SKIP_MICROVM_DEPS=false",
+	)
 }
 
 // InstallMicroVMDeps stages the micro-VM sandbox assets and applies the
-// cluster-wide `microvm` SandboxConfig, using upstream's
-// hack/install-microvm-deps.sh from the pinned checkout.
+// cluster-wide `microvm` SandboxConfig. It runs `ate-setup deploy
+// sandboxconfig` if the checkout has native Go micro-VM staging (see
+// microVMDepsStep), falling back to hack/install-microvm-deps.sh --install on
+// older trees such as the pinned Commit.
 //
-// This is a separate step because upstream makes it one: ate-setup applies the
-// gVisor SandboxConfig unconditionally, but the micro-VM one is opt-in and
-// needs its five sandbox binaries — cloud-hypervisor, virtiofsd, the guest
-// kernel, the guest rootfs and the base kata config — assembled and uploaded
-// under kata-assets/ first, because the runtime fetches them from the bucket
-// at boot rather than carrying them in the worker image.
+// In the wizard this is an opt-in step (Step 9): DeployAteSystem passes
+// ATE_INSTALL_SKIP_MICROVM_DEPS=true in Step 6 so the control-plane step only
+// applies the gVisor SandboxConfig, and Step 9 runs this step only when the
+// operator chooses Micro-VM. Its five sandbox binaries — cloud-hypervisor,
+// virtiofsd, the guest kernel, the guest rootfs and the base kata config — are
+// assembled and uploaded under kata-assets/ first, because the runtime fetches
+// them from the bucket at boot rather than carrying them in the worker image.
 //
-// The script is driven rather than reimplemented in Go: it computes the staged
+// Upstream is driven rather than reimplemented here: it computes the staged
 // virtiofsd's sha256 and injects it into the manifest at apply time, which
 // cannot be pinned ahead of time because the arm64 binary is built from source
 // and its bytes vary by toolchain.
 //
 // Credentials are fetched into a throwaway KUBECONFIG the same way the probes
-// do. The script refuses to run without a resolvable context — deliberately,
-// since it would otherwise discover the problem only after assembling and
+// do. Both paths refuse to run without a resolvable context — deliberately,
+// since they would otherwise discover the problem only after assembling and
 // uploading everything — and an install must target the cluster the wizard
 // chose, never whatever context happens to be ambient.
 func (b *Builder) InstallMicroVMDeps(st *state.Setup) execx.Spec {
+	const ateSetup = "go run ./cmd/ate-setup deploy sandboxconfig"
+	const fallback = "hack/install-microvm-deps.sh --install"
 	lines := credentialLines(st.ProjectID, st.ClusterName, st.Zone)
-	lines = append(lines, "hack/install-microvm-deps.sh --install")
+	// Display is fixed before the tree is inspected, so each branch says
+	// which one ran: that line is how the log tells them apart.
+	lines = append(lines,
+		"if [ -f "+microVMDepsStep+" ]; then",
+		"  echo "+ShellQuote("Deploying with: "+ateSetup),
+		"  "+ateSetup,
+		"else",
+		"  echo "+ShellQuote("Deploying with: "+fallback),
+		"  "+fallback,
+		"fi",
+	)
 	return execx.Spec{
-		Label:   "install-microvm-deps --install",
-		Display: "./hack/install-microvm-deps.sh --install",
-		Argv:    b.inTree(strings.Join(lines, "\n")),
-		Env:     b.microVMEnv(st),
+		Label: "deploy microvm-deps",
+		// Which command runs is decided in the script, so the title
+		// names the step and the script prints "Deploying with: …".
+		Display:          "deploy microvm-deps",
+		DisplayIsSummary: true,
+		Argv:             b.inTree(strings.Join(lines, "\n")),
+		Env:              b.microVMEnv(st),
 		SimLines: append(b.fetchSimLines(),
-			"[install-microvm-deps]: Assembling micro-VM assets into bin/microvm-assets/amd64 (ARCH=amd64)...",
-			"[install-microvm-deps]: Uploading assets to gs://"+st.BucketName+"/kata-assets/ ...",
-			"[install-microvm-deps]: Applying microvm SandboxConfig from manifests/microvm/sandboxconfig-microvm.yaml.tmpl...",
+			"[step]: deploy_sandbox_config",
+			"[step]: deploy_microvm_deps",
+			"[step]: Assembling micro-VM assets into bin/microvm-assets/amd64 (ARCH=amd64)...",
+			"[step]: Uploading assets to gs://"+st.BucketName+"/kata-assets/ ...",
+			"[step]: Applying microvm SandboxConfig from manifests/microvm/sandboxconfig-microvm.yaml.tmpl...",
 			"sandboxconfig.ate.dev/microvm created",
-			"[install-microvm-deps]: Done. ActorTemplates must reference this SandboxConfig by name (sandboxConfig.configName: microvm).",
+			"[step]: Done. ActorTemplates must reference this SandboxConfig by name (sandboxConfig.configName: microvm).",
 		),
 	}
 }

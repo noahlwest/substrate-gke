@@ -188,6 +188,9 @@ func Checks(snapshotRoot string, managed bool) []Check {
 		{
 			Key: "microvm-tools", Name: "Micro-VM asset tools", Fatal: false,
 			Run: func(ctx context.Context) Result {
+				if snapshot.HasMicroVMDeps(snapshotRoot) {
+					return Result{Pass, "built into ate-setup", ""}
+				}
 				if missing := MissingMicroVMTools(); len(missing) > 0 {
 					return Result{Warn,
 						fmt.Sprintf("missing %s; needed only if you select the Micro-VM sandbox", strings.Join(missing, ", ")),
@@ -226,9 +229,12 @@ func Checks(snapshotRoot string, managed bool) []Check {
 	return checks
 }
 
-// MicroVMTools are the host utilities the micro-VM path needs beyond the
-// always-checked ones: sha256sum, zstd and unzip for upstream's asset
-// scripts, and make and jq for the demo on older trees such as v0.1.0.
+// MicroVMTools are the host utilities the legacy micro-VM shell fallbacks need
+// beyond the always-checked ones: sha256sum, zstd and unzip for
+// hack/install-microvm-deps.sh on trees before ate-setup's native Go micro-VM
+// staging in cmd/ate-setup/internal/steps/microvm.go (which streams and
+// extracts .tar.zst archives and verifies SHA-256 checksums natively in Go),
+// and make and jq for the demo on older trees such as v0.1.0.
 var MicroVMTools = []string{"sha256sum", "zstd", "unzip", "jq", "make"}
 
 // MissingMicroVMTools returns whichever of MicroVMTools are not on PATH.
